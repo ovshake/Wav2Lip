@@ -7,6 +7,8 @@ from glob import glob
 import torch, face_detection
 from models import Wav2Lip
 import platform
+from pathlib import Path
+import os 
 
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
@@ -105,6 +107,17 @@ def face_detect(images):
 	del detector
 	return results 
 
+def smoothen_chin(f, x1, x2, y1, y2):
+	h = y2 - y1 
+	w = x2 - x1 
+	chin_point = (x1 + x2) // 2
+	width_w = 30
+	width_h = 10
+	# Grab ROI with Numpy slicing and blur
+	ROI = f[y2-width_h:y2+width_h, chin_point-width_w:chin_point+width_w]
+	blur = cv2.GaussianBlur(ROI, (7,7), 0) 
+	f[y2-width_h:y2+width_h, chin_point-width_w:chin_point+width_w] = blur
+	return f 
 def datagen(frames, mels):
 	img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
@@ -213,7 +226,8 @@ def main():
 			full_frames.append(frame)
 
 	print ("Number of frames available for inference: "+str(len(full_frames)))
-
+	audio_file_name = Path(args.audio).name.split('.')[0]
+	outfilename = Path(args.outfile).name.split('.')[0]
 	if not args.audio.endswith('.wav'):
 		print('Extracting raw audio...')
 		command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
@@ -263,17 +277,25 @@ def main():
 			pred = model(mel_batch, img_batch)
 
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
-		
-		for p, f, c in zip(pred, frames, coords):
+		save_dir = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync')
+		save_dir_patch = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync-patch')
+		print(f"save_dir: {save_dir}")
+		print(f"save_dir_patch: {save_dir_patch}")
+		os.makedirs(save_dir, exist_ok=True)
+		os.makedirs(save_dir_patch, exist_ok=True)
+		for idx, (p, f, c) in enumerate(zip(pred, frames, coords)):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-
+			cv2.imwrite(os.path.join(save_dir_patch, f"{idx:06d}.jpg"), p)
 			f[y1:y2, x1:x2] = p
+			f = smoothen_chin(f, x1, x2, y1, y2)
+			cv2.imwrite(os.path.join(save_dir, f"{idx:06d}.jpg"), f)
 			out.write(f)
 
 	out.release()
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
+	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', str(Path(save_dir).parent.absolute()) + f'/{outfilename}.mp4')
+	print(command)
 	subprocess.call(command, shell=platform.system() != 'Windows')
 
 if __name__ == '__main__':
