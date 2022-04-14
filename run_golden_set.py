@@ -1,6 +1,6 @@
 import glob 
 import os 
-
+import sys 
 
 def run_model(audio_path, video_path, save_dir, use_gan=False):
     if use_gan:
@@ -35,19 +35,20 @@ if __name__ == '__main__':
 
     talking_head_path_fmt = '/home/users/abhishekm/art-flow/fomm-relative-videos-2-images-1/{video_name}/{image_name}/result.mp4'
     polly_audio_file = '/home/users/abhishekm/art-flow/golden-set/audio_polly/Polly/v{version_index}/{audio_index}_v{version_index}.mp3'
+    deepzen_audio_file = '/home/users/abhishekm/art-flow/golden-set/audio_deepzen/DeepZen.io/v{version_index}/{audio_index:02d}_v{version_index}.wav'
     talking_head_paths = glob.glob(talking_head_path_fmt) 
-    save_dir = '/home/users/abhishekm/art-flow/fomm-relative-wav2lip-gan-v2/'
+    save_dir = '/home/users/abhishekm/art-flow/fomm-relative-wav2lip-v3-deepzen/'
     for video in videos:
         for image in images:
-    # for talking_head_path in talking_head_paths:
             talking_head_path = talking_head_path_fmt.format(video_name=video, image_name=image)
             driving_video_name = video
             source_image_name = image
             save_dir_talking_head = os.path.join(save_dir, driving_video_name, source_image_name) 
-            for version_index in [1, 2, 3]:
-                for audio_index in [1]:
-                    polly_audio = polly_audio_file.format(version_index=version_index, audio_index=audio_index)
-                    run_model(polly_audio, talking_head_path, save_dir_talking_head, use_gan=True)
+            for version_index in [1]:
+                for audio_index in [1, 5, 8]:
+                    # audio = polly_audio_file.format(version_index=version_index, audio_index=audio_index)
+                    audio = deepzen_audio_file.format(version_index=version_index, audio_index=audio_index)
+                    run_model(audio, talking_head_path, save_dir_talking_head, use_gan=False)
 
 
 

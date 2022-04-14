@@ -9,6 +9,12 @@ from models import Wav2Lip
 import platform
 from pathlib import Path
 import os 
+import time 
+from torch import nn
+from collections import abc
+# from apex import amp 
+# from torch.cuda import amp 
+from torch.cuda.amp import autocast
 
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
@@ -189,7 +195,95 @@ def load_model(path):
 	model.load_state_dict(new_s)
 
 	model = model.to(device)
+	model = model.half() 
+	# model = amp.initialize(model, opt_level='O3')
+	# patch_norm_fp32(model)
+	# for m in model.modules():
+	# 	if hasattr(m, 'fp16_enabled'):
+	# 		m.fp16_enabled = True
 	return model.eval()
+
+
+def cast_tensor_type(inputs, src_type, dst_type):
+    """Recursively convert Tensor in inputs from src_type to dst_type.
+    Note:
+        In v1.4.4 and later, ``cast_tersor_type`` will only convert the
+        torch.Tensor which is consistent with ``src_type`` to the ``dst_type``.
+        Before v1.4.4, it ignores the ``src_type`` argument, leading to some
+        potential problems. For example,
+        ``cast_tensor_type(inputs, torch.float, torch.half)`` will convert all
+        tensors in inputs to ``torch.half`` including those originally in
+        ``torch.Int`` or other types, which is not expected.
+    Args:
+        inputs: Inputs that to be casted.
+        src_type (torch.dtype): Source type..
+        dst_type (torch.dtype): Destination type.
+    Returns:
+        The same type with inputs, but all contained Tensors have been cast.
+    """
+    if isinstance(inputs, nn.Module):
+        return inputs
+    elif isinstance(inputs, torch.Tensor):
+        # we need to ensure that the type of inputs to be casted are the same
+        # as the argument `src_type`.
+        return inputs.to(dst_type) if inputs.dtype == src_type else inputs
+    elif isinstance(inputs, str):
+        return inputs
+    elif isinstance(inputs, np.ndarray):
+        return inputs
+    elif isinstance(inputs, abc.Mapping):
+        return type(inputs)({
+            k: cast_tensor_type(v, src_type, dst_type)
+            for k, v in inputs.items()
+        })
+    elif isinstance(inputs, abc.Iterable):
+        return type(inputs)(
+            cast_tensor_type(item, src_type, dst_type) for item in inputs)
+    else:
+        return inputs
+
+
+def patch_forward_method(func, src_type, dst_type, convert_output=True):
+    """Patch the forward method of a module.
+    Args:
+        func (callable): The original forward method.
+        src_type (torch.dtype): Type of input arguments to be converted from.
+        dst_type (torch.dtype): Type of input arguments to be converted to.
+        convert_output (bool): Whether to convert the output back to src_type.
+    Returns:
+        callable: The patched forward method.
+    """
+
+    def new_forward(*args, **kwargs):
+        output = func(*cast_tensor_type(args, src_type, dst_type),
+                      **cast_tensor_type(kwargs, src_type, dst_type))
+        if convert_output:
+            output = cast_tensor_type(output, dst_type, src_type)
+        return output
+
+    return new_forward
+
+
+
+def patch_norm_fp32(module):
+	"""Recursively convert normalization layers from FP16 to FP32.
+
+	Args:
+		module (nn.Module): The modules to be converted in FP16.
+
+	Returns:
+		nn.Module: The converted module, the normalization layers have been
+			converted to FP32.
+	"""
+	if isinstance(module, (nn.modules.batchnorm._BatchNorm, nn.GroupNorm)):
+		module.float()
+		if isinstance(module, nn.GroupNorm) or torch.__version__ < '1.3':
+			module.forward = patch_forward_method(module.forward, torch.half,
+												  torch.float)
+	for child in module.children():
+		patch_norm_fp32(child)
+	return module
+
 
 def main():
 	if not os.path.isfile(args.face):
@@ -226,18 +320,27 @@ def main():
 			full_frames.append(frame)
 
 	print ("Number of frames available for inference: "+str(len(full_frames)))
+	
+
 	audio_file_name = Path(args.audio).name.split('.')[0]
 	outfilename = Path(args.outfile).name.split('.')[0]
+	save_dir = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync')
+	save_dir_patch = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync-patch')
+	print(f"save_dir: {save_dir}")
+	print(f"save_dir_patch: {save_dir_patch}")
+	temp_dir = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name) 
+	temp_audio = os.path.join(temp_dir, 'temp/temp.wav') 
+	os.makedirs(os.path.dirname(temp_audio), exist_ok=True)
+	audio_processing_start_time = time.time() 
 	if not args.audio.endswith('.wav'):
 		print('Extracting raw audio...')
-		command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
+		command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, temp_audio)
 
 		subprocess.call(command, shell=True)
-		args.audio = 'temp/temp.wav'
+		args.audio = temp_audio
 
 	wav = audio.load_wav(args.audio, 16000)
 	mel = audio.melspectrogram(wav)
-	print(mel.shape)
 
 	if np.isnan(mel.reshape(-1)).sum() > 0:
 		raise ValueError('Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
@@ -259,44 +362,58 @@ def main():
 
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
+	audio_processing_end_time = time.time() 
 
 	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 		if i == 0:
 			model = load_model(args.checkpoint_path)
 			print ("Model loaded")
-
+			temp_video = os.path.join(temp_dir, 'temp/result.avi') 
+			os.makedirs(os.path.dirname(temp_video), exist_ok=True)
 			frame_h, frame_w = full_frames[0].shape[:-1]
-			out = cv2.VideoWriter('temp/result.avi', 
+			out = cv2.VideoWriter(temp_video, 
 									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
 
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
-
+		
+		print('No. of images', img_batch.shape)
+		model_start_inference_time = time.time() 
+		img_batch = img_batch.repeat(40, 1, 1, 1)
+		mel_batch = mel_batch.repeat(40, 1, 1, 1)
 		with torch.no_grad():
-			pred = model(mel_batch, img_batch)
-
+			with autocast():		
+				pred = model(mel_batch, img_batch)
+				# pred = model(mel_batch, img_batch)
+				# assert pred.dtype is torch.float16
+	
+		model_end_inference_time = time.time()
+		print(f"Model Inferencing time: {model_end_inference_time - model_start_inference_time:.4f}")
+		pred = pred[0]
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
-		save_dir = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync')
-		save_dir_patch = os.path.join(Path(args.outfile).parent.absolute(), audio_file_name ,'lipsync-patch')
-		print(f"save_dir: {save_dir}")
-		print(f"save_dir_patch: {save_dir_patch}")
 		os.makedirs(save_dir, exist_ok=True)
 		os.makedirs(save_dir_patch, exist_ok=True)
 		for idx, (p, f, c) in enumerate(zip(pred, frames, coords)):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-			cv2.imwrite(os.path.join(save_dir_patch, f"{idx:06d}.jpg"), p)
+			# cv2.imwrite(os.path.join(save_dir_patch, f"{idx:06d}.jpg"), p)
 			f[y1:y2, x1:x2] = p
 			f = smoothen_chin(f, x1, x2, y1, y2)
-			cv2.imwrite(os.path.join(save_dir, f"{idx:06d}.jpg"), f)
+			# cv2.imwrite(os.path.join(save_dir, f"{idx:06d}.jpg"), f)
 			out.write(f)
 
 	out.release()
+	
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', str(Path(save_dir).parent.absolute()) + f'/{outfilename}.mp4')
+	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, temp_video, str(Path(save_dir).parent.absolute()) + f'/{outfilename}.mp4')
 	print(command)
 	subprocess.call(command, shell=platform.system() != 'Windows')
+	video_processing_end_time = time.time() 
+
+	print(f"Audio Processing time: {audio_processing_end_time - audio_processing_start_time:.4f}")
+	print(f"Video Processing time: {video_processing_end_time - audio_processing_end_time:.4f}")
+	print(f"Model Inferencing time: {model_end_inference_time - model_start_inference_time:.4f}")
 
 if __name__ == '__main__':
 	main()
