@@ -380,8 +380,6 @@ def main():
 		
 		print('No. of images', img_batch.shape)
 		model_start_inference_time = time.time() 
-		img_batch = img_batch.repeat(40, 1, 1, 1)
-		mel_batch = mel_batch.repeat(40, 1, 1, 1)
 		with torch.no_grad():
 			with autocast():		
 				pred = model(mel_batch, img_batch)
@@ -390,7 +388,6 @@ def main():
 	
 		model_end_inference_time = time.time()
 		print(f"Model Inferencing time: {model_end_inference_time - model_start_inference_time:.4f}")
-		pred = pred[0]
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 		os.makedirs(save_dir, exist_ok=True)
 		os.makedirs(save_dir_patch, exist_ok=True)
